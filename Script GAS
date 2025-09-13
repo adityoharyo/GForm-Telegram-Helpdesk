@@ -1,0 +1,635 @@
+// Configuration
+var CONFIG = {
+    spreadsheetId: 'your_ss_id',
+    telegramBotToken: 'your_bot_token',
+    groupChatId: 'your_chat_id' // Untuk notifikasi grup
+  };
+  
+  // Database structure
+  var SHEETS = {
+    helpdesk: 'HelpdeskResponses',
+    verification: 'VerifikasiResponses',
+    tickets: 'Tickets',
+    logs: 'LogBot',
+    technicians: 'Technicians' // Sheet baru untuk daftar teknisi
+  };
+  
+  // Status definitions
+  var STATUS = {
+    waiting: 'Menunggu Petugas',
+    inProgress: 'Sedang Ditangani', 
+    verification: 'Menunggu Verifikasi',
+    completed: 'Selesai'
+  };
+  
+  /**
+   * Generate sequential ticket number (format: YYYYMMDD-XXXX)
+   * XXXX increments per date
+   */
+  function generateTicketNumber() {
+      var lock = LockService.getScriptLock();
+      lock.waitLock(3000); // Tunggu hingga 3 detik untuk mendapatkan lock
+      
+      try {
+        var ss = SpreadsheetApp.openById(CONFIG.spreadsheetId);
+        var counterSheet = ss.getSheetByName('TicketCounter');
+        
+        // Create counter sheet if not exists
+        if (!counterSheet) {
+          counterSheet = ss.insertSheet('TicketCounter');
+          counterSheet.getRange('A1:B1').setValues([['Date', 'Counter']]);
+        }
+        
+        var today = Utilities.formatDate(new Date(), 'Asia/Jakarta', 'yyyyMMdd');
+        var data = counterSheet.getDataRange().getValues();
+        var counter = 1;
+        
+        // Check if we have entry for today
+        for (var i = 1; i < data.length; i++) {
+          if (data[i][0] == today) {
+            counter = data[i][1] + 1;
+            counterSheet.getRange(i + 1, 2).setValue(counter);
+            return today + '-' + padNumber(counter, 4);
+          }
+        }
+        
+        // If no entry for today, create new
+        counterSheet.appendRow([today, counter]);
+        return today + '-' + padNumber(counter, 4);
+        
+      } finally {
+        lock.releaseLock(); // Pastikan untuk melepaskan lock
+      }
+    }
+    
+    function padNumber(num, size) {
+      var s = num + '';
+      while (s.length < size) s = '0' + s;
+      return s;
+    }
+    
+    
+  
+  /**
+   * MAIN FORM SUBMIT TRIGGER
+   * Handles both Helpdesk and Verification form submissions
+   */
+  function onFormSubmit(e) {
+      try {
+        var sheetName = e.range.getSheet().getName();
+        
+        // Log the trigger event
+        logActivity('FORM_SUBMIT', '', 'Sheet: ' + sheetName);
+        
+        if (sheetName === SHEETS.helpdesk) {
+          handleHelpdeskSubmission(e);
+        } 
+        else if (sheetName === SHEETS.verification) {
+          handleVerificationSubmission(e);
+        }
+        else {
+          logActivity('UNKNOWN_SHEET', '', 'Received submission from unknown sheet: ' + sheetName);
+        }
+        
+      } catch (error) {
+        logError(error, 'onFormSubmit');
+      }
+    }
+    
+    /**
+     * Handle Helpdesk form submission
+     */
+    function handleHelpdeskSubmission(e) {
+      var lock = LockService.getScriptLock();
+      lock.waitLock(3000);
+    
+      try {
+        var ss = SpreadsheetApp.openById(CONFIG.spreadsheetId);
+        var sheet = ss.getSheetByName(SHEETS.helpdesk);
+        var ticketsSheet = ss.getSheetByName(SHEETS.tickets);
+    
+        var ticketNumber = generateTicketNumber();
+        var row = e.range.getRow();
+    
+        // update kolom nomor tiket (kolom 14)
+        sheet.getRange(row, 14).setValue(ticketNumber);
+    
+        var helpdeskType = e.values[7]; // pilihan helpdesk
+        var namaPelapor = e.values[2];
+        var nomorWA = "";
+        var issue = "";
+        var lokasi = "";
+        var kategori = "";
+        var asalBidang = "";
+    
+        if (helpdeskType === "Helpdesk IT") {
+          asalBidang = e.values[3];
+          kategori = e.values[8];     // kategori IT
+          issue = e.values[4];        // detail masalah IT
+          lokasi = e.values[5];       // lokasi masalah IT
+          nomorWA = formatWhatsAppNumber(e.values[6]); // WA IT
+        } else if (helpdeskType === "Helpdesk Transmisi") {
+          kategori = e.values[9];    // kategori Transmisi
+          issue = e.values[11];       // detail masalah Transmisi
+          lokasi = e.values[10];      // lokasi transmisi
+          nomorWA = formatWhatsAppNumber(e.values[12]); // WA Transmisi
+        }
+    
+        ticketsSheet.appendRow([
+          ticketNumber,
+          STATUS.waiting,
+          '', // Technician name
+          '', // Technician chat_id  
+          new Date(), // Created time
+          '', // Start time
+          '', // End time
+          namaPelapor,
+          helpdeskType,
+          asalBidang,
+          kategori,
+          issue,
+          lokasi,
+          nomorWA
+        ]);
+    
+        logActivity('NEW_TICKET', ticketNumber);
+        notifyNewTicket(ticketNumber, helpdeskType, namaPelapor, asalBidang, lokasi, nomorWA, issue, kategori);
+    
+      } finally {
+        lock.releaseLock();
+      }
+    }
+    
+    
+   /**
+   * Handle Verification form submission 
+   */
+  function handleVerificationSubmission(e) {
+      var lock = LockService.getScriptLock();
+      lock.waitLock(3000);
+  
+      try{
+          var ss = SpreadsheetApp.openById(CONFIG.spreadsheetId);
+          var ticketsSheet = ss.getSheetByName(SHEETS.tickets);
+          var ticketNumber = e.values[2];
+          
+          // Update ticket status
+          var ticketsData = ticketsSheet.getDataRange().getValues();
+          for (var i = 1; i < ticketsData.length; i++) {
+          if (ticketsData[i][0] === ticketNumber) {
+              ticketsSheet.getRange(i+1, 2).setValue(STATUS.completed);
+              ticketsSheet.getRange(i+1, 7).setValue(new Date());
+              
+              logActivity('TICKET_VERIFIED', ticketNumber);
+              
+              // Send completion notification to group
+              notifyGroupCompletion(
+              ticketNumber,
+              ticketsData[i][8], // Reporter name
+              ticketsData[i][2], // Technician name
+              e.values[4], // Hasil pekerjaan
+              e.values[5], // Rating
+              e.values[7]  // Comment
+              );
+              break;
+          }
+          }
+      } finally {
+          lock.releaseLock();
+      }
+      
+    }
+       
+   /**
+     * Notify group chat about ticket completion
+     */
+   function notifyGroupCompletion(ticketNumber, reporterName, technicianName, hasil, rating, comment) {
+      var message = `✅ *Tiket Selesai* #${ticketNumber}\n \n` +
+        `👤 Pelapor: ${reporterName}\n` +
+        `👨‍🔧 Teknisi: ${technicianName}\n` +
+        `📝 Hasil Pekerjaan: ${hasil}\n` +
+        `⭐ Rating: ${rating}/5\n` +
+        `💬 Komentar: ${comment || '-'}\n\n` +
+        `_Tiket ini telah ditandai sebagai selesai setelah diverifikasi_`;
+      
+      sendTelegramMessage(CONFIG.groupChatId, message);
+    }
+    
+  /**
+   * Notify group about new ticket (with Take button)
+   */
+  function notifyNewTicket(ticketNumber, helpdeskType, namaPelapor, asalBidang, lokasi, nomorWA, issue, kategori) {
+    var extra = "";
+    if (helpdeskType === "Helpdesk IT") {
+      extra = `🏢 Asal Bidang: ${asalBidang}\n`;
+    }
+  
+    // judul beda sesuai helpdesk
+    var header = (helpdeskType === "Helpdesk IT") 
+      ? `💻 *Tiket Baru - Helpdesk IT* #${ticketNumber}`
+      : `📡 *Tiket Baru - Helpdesk Transmisi* #${ticketNumber}`;
+  
+    var message = `${header}\n\n` +
+      `👤 ${namaPelapor}\n` +
+      extra +
+      `📍 ${lokasi}\n` +
+      `📞 ${nomorWA}\n` +
+      `🗂 Kategori: ${kategori}\n` +
+      `📝 Masalah: ${issue}`;
+  
+    var keyboard = {
+      inline_keyboard: [[{
+        text: "🛠️ Ambil Tiket",
+        callback_data: `take_${ticketNumber}`
+      }]]
+    };
+  
+    sendTelegramMessage(CONFIG.groupChatId, message, keyboard);
+  }
+  
+  
+  /**
+   * Handle Telegram callback queries
+   */
+  function doPost(e) {
+    var update = JSON.parse(e.postData.contents);
+    logActivity('Data diterima: ' + JSON.stringify(update));
+
+    if (update.callback_query) {
+      var data = update.callback_query.data;
+      var chatId = update.callback_query.from.id;
+      var messageId = update.callback_query.message.message_id;
+      
+      if (data.startsWith('take_')) {
+        handleTakeTicket(
+          data.split('_')[1], // ticketNumber
+          chatId,
+          update.callback_query.from.first_name,
+          messageId
+        );
+        logActivity('variabel chatId ini isinya ' + chatId + update.callback_query.from.first_name);
+      }
+      else if (data.startsWith('complete_')) {
+        handleCompleteTicket(
+          data.split('_')[1], // ticketNumber
+          chatId,
+          messageId
+        );
+      }
+    }
+    
+    return ContentService.createTextOutput();
+  }
+  
+  /**
+   * Handle ticket assignment
+   */
+  function handleTakeTicket(ticketNumber, technicianChatId, technicianName, messageId) {
+    try {
+        var ss = SpreadsheetApp.openById(CONFIG.spreadsheetId);
+        var ticketsSheet = ss.getSheetByName(SHEETS.tickets);
+        
+        // Update ticket record
+        var ticketsData = ticketsSheet.getDataRange().getValues();
+        for (var i = 1; i < ticketsData.length; i++) {
+            if (ticketsData[i][0] === ticketNumber) {
+                // Cek apakah tiket sudah diambil
+                if (ticketsData[i][2] !== '') {
+                    // Tiket sudah diambil, tidak perlu memproses lagi
+                    return;
+                }
+                
+                // Update ticket status and assignee
+                ticketsSheet.getRange(i + 1, 2).setValue(STATUS.inProgress);
+                ticketsSheet.getRange(i + 1, 3).setValue(technicianName);
+                ticketsSheet.getRange(i + 1, 4).setValue(technicianChatId);
+                ticketsSheet.getRange(i + 1, 6).setValue(new Date());
+                
+                // Log assignment
+                logActivity('TICKET_ASSIGNED', ticketNumber, technicianChatId);
+                
+                // Register technician if new
+                registerTechnician(technicianChatId, technicianName);
+                
+                // Remove Take button from group
+                deleteTelegramMessage(CONFIG.groupChatId, messageId);
+                
+                // Send details to technician
+                sendAssignmentDetails(ticketNumber, technicianChatId);
+                break;
+            }
+        }
+        
+    } catch (error) {
+        logError(error, 'handleTakeTicket');
+    }
+}
+  
+  /**
+   * Send complete ticket details to assigned technician
+   */
+  function sendAssignmentDetails(ticketNumberParam, chatIdParam) {
+    var ss = SpreadsheetApp.openById(CONFIG.spreadsheetId);
+    var ticketsSheet = ss.getSheetByName(SHEETS.tickets);
+    
+    var ticketsData = ticketsSheet.getDataRange().getValues();
+    var ticket;
+    
+    // Cari detail tiket berdasarkan ticketNumberParam
+    for (var i = 1; i < ticketsData.length; i++) {
+      if (ticketsData[i][0] === ticketNumberParam) {
+        ticket = ticketsData[i];
+        break;
+      }
+    }
+    
+    if (!ticket) return;
+  
+    // Gunakan nama variabel berbeda untuk menghindari tumpang tindih
+    var assignedChatId = String(ticket[3]);
+    var assignedTicketNumber = ticket[0];
+    var status = ticket[1];
+    var technicianName = ticket[2];
+    var createdTime = ticket[4];
+    var namaPelapor = ticket[7];
+    var helpdeskType = ticket[8];
+    var asalBidang = ticket[9];
+    var kategori = ticket[10];
+    var issue = ticket[11];
+    var lokasi = ticket[12];
+    var nomorWA = formatWhatsAppNumber(ticket[13]);
+  
+    // Header pesan sesuai tipe helpdesk
+    var header = (helpdeskType === "Helpdesk IT") 
+      ? `💻 *Detail Tiket Helpdesk IT* #${assignedTicketNumber}`
+      : `📡 *Detail Tiket Helpdesk Transmisi* #${assignedTicketNumber}`;
+  
+    // Extra field khusus IT
+    var extra = (helpdeskType === "Helpdesk IT" && asalBidang) 
+      ? `🏢 Asal Bidang: ${asalBidang}\n`
+      : "";
+  
+    // Pesan lengkap
+    var message = `${header}\n\n` +
+      `📌 Status: ${status}\n` +
+      (technicianName ? `👨‍🔧 Teknisi: ${technicianName}\n` : "") +
+      `👤 Pelapor: ${namaPelapor}\n` +
+      extra +
+      `📍 Lokasi: ${lokasi}\n` +
+      `🗂 Kategori: ${kategori}\n` +
+      `📝 Masalah: ${issue}\n` +
+      `📞 WA: ${nomorWA}\n` +
+      `🕒 Dibuat: ${createdTime}`;
+  
+    var keyboard = {
+      inline_keyboard: [
+        [{
+          text: "📱 Hubungi Pelapor",
+          url: `https://wa.me/${nomorWA}?text=Halo%20${encodeURIComponent(namaPelapor)},%20saya%20menangani%20tiket%20${assignedTicketNumber}%20masalah%20${encodeURIComponent(issue)}%20di%20${encodeURIComponent(lokasi)}.%20Bisa%20diberi%20info%20lebih%20detail?`
+        }],
+        [{
+          text: "✅ Selesaikan Tiket",
+          callback_data: `complete_${assignedTicketNumber}`
+        }]
+      ]
+    };
+  
+    sendTelegramMessage(assignedChatId, message, keyboard);
+  }
+  
+  
+  /**
+   * Handle ticket completion
+   */
+  function handleCompleteTicket(ticketNumber, technicianChatId, messageId) {
+    var chatId = String(technicianChatId);
+    try {
+      var ss = SpreadsheetApp.openById(CONFIG.spreadsheetId);
+      var ticketsSheet = ss.getSheetByName(SHEETS.tickets);
+      
+      // Find and update ticket
+      var ticketsData = ticketsSheet.getDataRange().getValues();
+        for (var i = 1; i < ticketsData.length; i++) {
+            if (ticketsData[i][0] === ticketNumber) {
+                // Cek apakah verifikasi sudah dikirim
+                if (ticketsData[i][1] === STATUS.verification || ticketsData[i][1] === STATUS.completed) {
+                    // status sudah menunggu verifikasi atau selesai, stop sampai disini
+                    return;
+                }
+                
+                // Update status
+                ticketsSheet.getRange(i + 1, 2).setValue(STATUS.verification);
+                ticketsSheet.getRange(i + 1, 7).setValue(new Date());
+                
+                // Create verification link
+                var verificationLink = createVerificationLink(ticketNumber, ticketsData[i][8]);
+                
+                // Send verification prompt
+                sendVerificationRequest(
+                    chatId,
+                    ticketNumber,
+                    ticketsData[i][7],
+                    ticketsData[i][13],
+                    verificationLink
+                );
+                
+                logActivity('TICKET_COMPLETED', ticketNumber);
+                break;
+            }
+        }
+        
+        // Remove completion message
+        deleteTelegramMessage(technicianChatId, messageId);
+        
+    } catch (error) {
+        logError(error, 'handleCompleteTicket');
+    }
+}
+
+  
+  // ===== HELPER FUNCTIONS ===== //
+  
+  function registerTechnician(chatId, name) {
+    var ss = SpreadsheetApp.openById(CONFIG.spreadsheetId);
+    var sheet = ss.getSheetByName(SHEETS.technicians);
+    var data = sheet.getDataRange().getValues();
+    
+    // Check if already registered
+    for (var i = 1; i < data.length; i++) {
+      if (data[i][0] == chatId) return;
+    }
+    
+    // Register new technician
+    sheet.appendRow([chatId, name, new Date()]);
+  }
+  
+  function createVerificationLink(ticketNumber, reporterName) {
+    var formUrl = 'https://docs.google.com/forms/d/e/1FAIpQLSeYcJlJtS7r_8NMhBCXPHOYZzWAfqocYopZfUxgUPGqsviLog/viewform';
+    return `${formUrl}?entry.1969904289=${ticketNumber}&entry.1350990429=${encodeURIComponent(reporterName)}`;
+  }
+  
+  function sendVerificationRequest(chatId, ticketNumber, reporterName, whatsapp, link) {
+    var message = `📩 *Kirim Verifikasi ke Pelapor*\n\n` +
+      `Tiket #${ticketNumber} telah selesai.\n` +
+      `Mohon kirim link verifikasi ke ${reporterName}:`;
+    
+    var keyboard = {
+      inline_keyboard: [[{
+        text: "📤 Kirim Link Verifikasi",
+        url: `https://wa.me/${formatWhatsAppNumber(whatsapp)}?text=Halo%20${encodeURIComponent(reporterName)},%20tiket%20${ticketNumber}%20telah%20selesai.%20Mohon%20verifikasi%20di:%20${encodeURIComponent(link)}`
+      }]]
+    };
+    
+    sendTelegramMessage(chatId, message, keyboard);
+  }
+  
+  function sendTelegramMessage(chatId, message, keyboard) {
+  const payload = {
+    chat_id: chatId,
+    text: message,
+    parse_mode: 'Markdown',
+    reply_markup: JSON.stringify(keyboard)
+  };
+
+  const url = `https://api.telegram.org/bot${CONFIG.telegramBotToken}/sendMessage`;
+  
+  // 1. Log REQUEST yang akan dikirim
+  logActivity(`[REQUEST] Mengirim ke ${chatId} | URL: ${url} | Payload: ${JSON.stringify(payload)}`);
+
+  try {
+    // 2. Kirim request dengan muteHttpExceptions: true untuk ambil response meskipun error
+    const options = {
+      method: 'POST',
+      payload: payload,
+      muteHttpExceptions: true
+    };
+    
+    const response = UrlFetchApp.fetch(url, options);
+    const responseData = JSON.parse(response.getContentText());
+    
+    // 3. Log RESPONSE dari Telegram
+    logActivity(`[RESPONSE] dari ${chatId} | Status: ${response.getResponseCode()} | Data: ${JSON.stringify(responseData)}`);
+    
+    // Handle error response
+    if (!responseData.ok) {
+      logActivity(`[ERROR] Telegram API Error: ${responseData.description || 'Unknown error'}`);
+    }
+    
+    return responseData;
+
+  } catch (e) {
+    // 4. Log EXCEPTION jika fetch gagal
+    logActivity(`[FETCH ERROR] Gagal mengirim ke ${chatId}: ${e.message}`);
+    throw e; // Re-throw exception jika ingin ditangani di level lebih tinggi
+  }
+}
+
+function testsendTelegramMessage(chatId, message, keyboard) {
+  var id = 204321099;
+  var chatId = String(id);
+  var message = `✅ *Anda mengambil tiket* #inidummy\n\n` +
+      `👤 Pelapor: inidummy\n` +
+      `📱 WA: inidummy\n` +
+      `🏢 Dept: inidummy\n` +
+      `📍 Lokasi: inidummy\n` +
+      `📝 Masalah: inidummy\n` +
+      `⏱ Dibuat: inidummy`;
+  var keyboard = {
+      inline_keyboard: [
+        [{
+          text: "📱 Hubungi Pelapor",
+          url: `https://wa.me/6281322812431?text=Halo%20dummy,%20saya%20menangani%20tiket%20inidummy.%20Bisa%20diberi%20info%20lebih%20detail?`
+        }],
+        [{
+          text: "✅ Selesaikan Tiket",
+          url: `https://wa.me/6281322812431?text=Halo%20dummy,%20saya%20menangani%20tiket%20inidummy.%20Bisa%20diberi%20info%20lebih%20detail?`
+        }]
+      ]
+    };
+
+  const payload = {
+    chat_id: chatId,
+    text: message,
+    parse_mode: 'Markdown',
+    reply_markup: JSON.stringify(keyboard)
+  };
+
+  const url = `https://api.telegram.org/bot${CONFIG.telegramBotToken}/sendMessage`;
+  
+  // 1. Log REQUEST yang akan dikirim
+  logActivity(`[REQUEST] Mengirim ke ${chatId} | URL: ${url} | Payload: ${JSON.stringify(payload)}`);
+  Logger.log(`[REQUEST] Mengirim ke ${chatId} | URL: ${url} | Payload: ${JSON.stringify(payload)}`);
+
+  try {
+    // 2. Kirim request dengan muteHttpExceptions: true untuk ambil response meskipun error
+    const options = {
+      method: 'POST',
+      payload: payload,
+      muteHttpExceptions: true
+    };
+    
+    const response = UrlFetchApp.fetch(url, options);
+    const responseData = JSON.parse(response.getContentText());
+    
+    // 3. Log RESPONSE dari Telegram
+    logActivity(`[RESPONSE] dari ${chatId} | Status: ${response.getResponseCode()} | Data: ${JSON.stringify(responseData)}`);
+    Logger.log(`[RESPONSE] dari ${chatId} | Status: ${response.getResponseCode()} | Data: ${JSON.stringify(responseData)}`);
+    
+    // Handle error response
+    if (!responseData.ok) {
+      logActivity(`[ERROR] Telegram API Error: ${responseData.description || 'Unknown error'}`);
+      Logger.log(`[ERROR] Telegram API Error: ${responseData.description || 'Unknown error'}`);
+    }
+    
+    return responseData;
+
+  } catch (e) {
+    // 4. Log EXCEPTION jika fetch gagal
+    logActivity(`[FETCH ERROR] Gagal mengirim ke ${chatId}: ${e.message}`);
+    throw e; // Re-throw exception jika ingin ditangani di level lebih tinggi
+  }
+}
+
+  
+  function deleteTelegramMessage(chatId, messageId) {
+      try {
+          UrlFetchApp.fetch(`https://api.telegram.org/bot${CONFIG.telegramBotToken}/editMessageReplyMarkup`, {
+            method: "POST",
+            contentType: "application/json",
+            payload: JSON.stringify({
+              chat_id: chatId,
+              message_id: messageId,
+              reply_markup: { inline_keyboard: [] }
+            })
+          });
+        } catch (e) {
+          Logger.log("ERROR in removeInlineKeyboard for chat " + chatId + ", msg " + messageId + ": " + e.message);
+        }
+      }
+      
+  function logActivity(action, ticketNumber, details) {
+    var ss = SpreadsheetApp.openById(CONFIG.spreadsheetId);
+    ss.getSheetByName(SHEETS.logs).appendRow([
+      new Date(),
+      action,
+      ticketNumber || '',
+      details || ''
+    ]);
+  }
+  
+  function formatDate(date) {
+    return Utilities.formatDate(date, 'Asia/Jakarta', 'dd/MM HH:mm');
+  }
+  
+  function formatWhatsAppNumber(input) {
+      if (!input) return "";
+    input = String(input).replace(/\D/g, ''); // Hapus semua karakter non-digit
+    if (input.startsWith("0")) return "62" + input.slice(1);
+    if (!input.startsWith("62") && input.length > 5) return "62" + input;
+    return input;
+    }
+  
+  function logError(error, context) {
+    Logger.log('Error in ' + context + ': ' + error.toString());
+    logActivity('ERROR', context, error.toString());
+  }
